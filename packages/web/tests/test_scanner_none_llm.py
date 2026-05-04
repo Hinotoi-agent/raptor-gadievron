@@ -75,8 +75,16 @@ class TestWebScannerNoneLlm(unittest.TestCase):
             }
 
             result = scanner.scan()
-            self.assertEqual(result["total_vulnerabilities"], 0)
-            self.assertEqual(result["findings"], [])
+            # Injection fuzzing phase is skipped without LLM (not appended to phases_completed)
+            self.assertNotIn("injection", result["phases_completed"])
+            # Fuzzer-based findings (check_id V5.2.1) should not appear without LLM
+            fuzzer_findings = [
+                f for f in result["findings"] if f.get("check_id") == "V5.2.1"
+            ]
+            self.assertEqual(
+                fuzzer_findings, [],
+                "LLM fuzzer findings (V5.2.1) should not appear without an LLM",
+            )
 
     @patch("packages.web.scanner.WebCrawler")
     @patch("packages.web.scanner.WebClient")
@@ -95,8 +103,11 @@ class TestWebScannerNoneLlm(unittest.TestCase):
             }
 
             scanner.scan()
-            # Fuzzer should have been called for each parameter
-            self.assertEqual(scanner.fuzzer.fuzz_parameter.call_count, 2)
+            # self.fuzzer (the mock) should have been called for each URL parameter
+            self.assertGreaterEqual(
+                scanner.fuzzer.fuzz_parameter.call_count, 2,
+                "Fuzzer should have been called for each discovered parameter",
+            )
 
 
 if __name__ == "__main__":

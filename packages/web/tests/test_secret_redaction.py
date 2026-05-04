@@ -9,7 +9,11 @@ class DummyLLM:
 
 
 def _response():
-    return SimpleNamespace(status_code=200, content=b"ok", text="sql syntax error")
+    return SimpleNamespace(
+        status_code=200,
+        content=b"ok",
+        text="You have an error in your SQL syntax near ''1'='1'",
+    )
 
 
 def test_web_client_redacts_secret_urls_in_history_by_default():

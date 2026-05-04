@@ -66,63 +66,51 @@ class WebFuzzer:
         findings = []
 
         for vuln_type in vulnerability_types:
-            # Generate intelligent payloads using LLM
             payloads = self._generate_payloads(param_name, param_type, vuln_type)
 
+            # Stop at the first confirmed finding per (parameter, vuln_type) pair --
+            # one confirmed payload is enough evidence; reporting all 10 that match
+            # the same heuristic is noise, not signal.
             for payload in payloads:
                 finding = self._test_payload(url, param_name, payload, vuln_type)
                 if finding:
                     findings.append(finding)
                     self.findings.append(finding)
+                    break  # confirmed for this vuln_type, move to next
 
         return findings
 
     def _generate_payloads(self, param_name: str, param_type: str,
                           vuln_type: str, count: int = 10) -> List[str]:
         """Generate intelligent payloads using LLM."""
-        prompt = f"""You are a senior penetration tester generating test payloads for security testing.
+        system = (
+            "You are a senior penetration tester generating test payloads for authorised security testing. "
+            "Respond with a JSON object containing exactly one key 'payloads' whose value is an array of strings. "
+            "No explanation, no markdown, no extra keys. Output only the JSON object."
+        )
+        prompt = (
+            f"Generate {count} payloads to test a parameter named '{param_name}' "
+            f"(type: {param_type}) for {vuln_type} vulnerabilities. "
+            "Tailor payloads to the parameter name and type. "
+            "Include basic, advanced, and evasion variants."
+        )
 
-**Target Parameter:**
-- Name: {param_name}
-- Type: {param_type}
-- Vulnerability Type to Test: {vuln_type}
-
-**Your Task:**
-Generate {count} intelligent, context-aware payloads to test for {vuln_type} vulnerabilities.
-
-**Requirements:**
-1. Payloads should be realistic and likely to trigger the vulnerability
-2. Include both basic and advanced evasion techniques
-3. Tailor payloads to the parameter name and type
-4. Include boundary cases and edge cases
-5. Add polyglot payloads when relevant
-
-**Examples of what to consider:**
-- For 'email' parameters: email-specific injection vectors
-- For 'id' or 'user_id': numeric SQL injection, IDOR tests
-- For 'search' or 'query': Full-text search injection
-- For 'file' or 'path': Path traversal, file inclusion
-
-Respond with a JSON array of payload strings."""
-
-        schema = {
-            "payloads": "array - list of payload strings"
-        }
+        schema = {"payloads": "array of payload strings"}
 
         try:
             result, _ = self.llm.generate_structured(
                 prompt=prompt,
                 schema=schema,
+                system_prompt=system,
             )
-
             payloads = result.get('payloads', [])
-            logger.info(f"Generated {len(payloads)} payloads for {vuln_type}")
-            return payloads
-
+            if payloads:
+                logger.info(f"Generated {len(payloads)} payloads for {vuln_type}")
+                return [str(p) for p in payloads if p]
         except Exception as e:
-            logger.error(f"Failed to generate payloads: {e}")
-            # Fallback to basic payloads
-            return self._get_basic_payloads(vuln_type)
+            logger.debug(f"LLM payload generation failed: {e}")
+
+        return self._get_basic_payloads(vuln_type)
 
     def _get_basic_payloads(self, vuln_type: str) -> List[str]:
         """Fallback basic payloads when LLM fails."""
@@ -161,22 +149,72 @@ Respond with a JSON array of payload strings."""
         return None
 
     def _analyze_response(self, response, payload: str, vuln_type: str) -> bool:
-        """Use LLM to analyze if response indicates vulnerability."""
-        # For now, simple heuristics (can be enhanced with LLM)
+        """Determine whether a response indicates exploitation.
+
+        Uses tight evidence-based heuristics. A positive match requires
+        unambiguous server-side execution evidence, not just reflection of
+        the payload or presence of a keyword in marketing copy.
+        """
+        body = response.text if isinstance(response.text, str) else ""
+        body_lower = body.lower()
+
         if vuln_type == 'sqli':
-            errors = ['sql', 'mysql', 'postgres', 'syntax error', 'database']
-            return any(err in response.text.lower() for err in errors)
+            # Must be a database error message, not just the word "sql"
+            error_patterns = [
+                "you have an error in your sql syntax",
+                "warning: mysql",
+                "unclosed quotation mark",
+                "quoted string not properly terminated",
+                "sqlexception",
+                "ora-01756",
+                "pg::syntaxerror",
+                "sqlite3::exception",
+                "syntax error near",
+                "unterminated string",
+            ]
+            return any(p in body_lower for p in error_patterns)
 
         elif vuln_type == 'xss':
-            return payload in response.text
+            # Payload must be unescaped in the body (not HTML-encoded)
+            # Check that the raw payload appears verbatim, not &lt;script&gt;
+            if payload in body:
+                encoded = payload.replace("<", "&lt;").replace(">", "&gt;")
+                # If the encoded version also appears it might just be escaped output
+                # Prefer the raw appearance in a script/event context
+                return payload in body and encoded not in body
+            return False
+
+        elif vuln_type == 'ssti':
+            # Template injection: look for evaluated arithmetic result
+            import re
+            # Common probes: {{7*7}}=49, ${7*7}=49, <%= 7*7 %>=49
+            math_results = re.findall(r'\b(49|7777777)\b', body)
+            return bool(math_results)
 
         elif vuln_type == 'command_injection':
-            indicators = ['root:', 'bin/bash', 'uid=', 'gid=']
-            return any(ind in response.text for ind in indicators)
+            # Must see actual OS command output, not just an error
+            os_indicators = [
+                "root:x:0:0",           # /etc/passwd line
+                "uid=0(root)",
+                "uid=33(www-data)",
+                "/bin/bash",
+                "/bin/sh",
+                "volume serial number",  # Windows dir output
+                "windows ip configuration",
+            ]
+            return any(ind in body_lower for ind in os_indicators)
 
         elif vuln_type == 'path_traversal':
-            indicators = ['root:x:', '[boot loader]', 'windows']
-            return any(ind in response.text.lower() for ind in indicators)
+            # Must see actual file content, not just an error
+            file_indicators = [
+                "root:x:0:0",         # /etc/passwd
+                "[boot loader]",       # Windows boot.ini
+                "[operating systems]",
+                "for 16-bit app support",
+                "daemon:x:",
+                "nobody:x:",
+            ]
+            return any(ind in body_lower for ind in file_indicators)
 
         return False
 
